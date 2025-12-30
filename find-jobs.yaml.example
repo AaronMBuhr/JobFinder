@@ -1,0 +1,41 @@
+rapidapi_key: "YOUR_RAPIDAPI_KEY"
+google_api_key: "YOUR_GOOGLE_API_KEY"
+
+# Broad search terms to pull a large set of remote jobs; the LLM will filter.
+# REQUIRED: provide at least one query.
+queries:
+  - "Senior Software Engineer Remote"
+  - "Backend Developer Remote"
+  - "Systems Engineer Remote"
+
+# Number of days back from today to include.
+# 0 = today only
+# 1 = since yesterday (last 1 day)
+# 3 = yesterday + two prior days (last 3 days)
+date_posted_days_ago: 1
+
+# Limit to remote jobs only.
+remote_jobs_only: true
+
+# Path to your resume/CV. Supports .txt, .md, or .docx.
+# If omitted, you must supply --resume at runtime.
+# Use forward slashes or escape backslashes in Windows paths.
+resume_file: "resume.docx"
+
+# REQUIRED: Prompt instructions sent to Gemini before appending your resume + job list.
+# Use {job_count} as a placeholder for the number of jobs.
+prompt: |
+  I am a Senior Software Engineer.
+  Attached is my Resume and a list of {job_count} recent job postings.
+
+  TASK:
+  Identify the jobs that match my profile with a score of 90/100 or higher.
+
+  STRICT FILTERING CRITERIA:
+  1. MUST involve Python, Go, or systems programming.
+  2. MUST be backend, infrastructure, or platform engineering.
+  3. REJECT all Frontend, React, or Web Design roles.
+  4. REJECT all staffing agencies.
+
+  Return the results in descending order by score.
+

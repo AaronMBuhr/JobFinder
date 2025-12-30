@@ -1,0 +1,5 @@
+requests
+google-genai
+PyYAML
+python-docx
+
