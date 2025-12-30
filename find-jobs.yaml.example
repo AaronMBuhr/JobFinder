@@ -8,11 +8,9 @@ queries:
   - "Backend Developer Remote"
   - "Systems Engineer Remote"
 
-# Number of days back from today to include.
-# 0 = today only
-# 1 = since yesterday (last 1 day)
-# 3 = yesterday + two prior days (last 3 days)
-date_posted_days_ago: 1
+# Number of days back from today to include (any value, filtered locally).
+# 0 = today only, 7 = last week, 14 = last two weeks, etc.
+date_posted_days_ago: 3
 
 # Limit to remote jobs only.
 remote_jobs_only: true
@@ -39,3 +37,24 @@ prompt: |
 
   Return the results in descending order by score.
 
+  If JSON output is selected below, return a JSON array where each object has:
+    - "position": Position Name
+    - "company": Company Name
+    - "score": Match Score (integer)
+    - "reason": Why it fits
+    - "short_description": A summary of the position information provided in the listing
+    - "link": Application URL
+
+  If markdown output is selected below, explicitly specify the following information
+  for each position:
+    * Position Name
+    * Company
+    * Match Score
+    * Why it fits
+    * Short Description (a summary of the position information provided in the position listing)
+    * Link
+
+  If markdown output is selected below, then group the results by position. The markdown for
+  each position should have the company name dash position name as the title, then
+  beneath that header it would have the remaining information, and then a margin or gap
+  before the next position.

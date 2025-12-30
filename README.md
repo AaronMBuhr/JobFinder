@@ -39,8 +39,8 @@ queries:
   - "Backend Developer Remote"
   - "Systems Engineer Remote"
 
-# Date window: 0 = today only, 1 = since yesterday, 3 = last 3 days
-date_posted_days_ago: 1
+# Date window (any value, filtered locally): 0 = today, 7 = week, 14 = two weeks
+date_posted_days_ago: 3
 
 # Limit to remote jobs only
 remote_jobs_only: true
@@ -93,13 +93,15 @@ python find-jobs.py [options]
 
 | Flag | Description |
 |------|-------------|
+| `-h, --help` | Show help message and exit |
 | `-c, --config FILE` | Path to YAML config (default: `find-jobs.yaml`) |
 | `-r, --resume FILE` | Override resume file path |
-| `-f, --from-days N` | Override date window (0=today, 1=yesterday, etc.) |
+| `-f, --from-days N` | Override date window (any value, e.g. 0=today, 7=week, 14=two weeks) |
 | `-o, --output-to-file` | Write to timestamped file instead of stdout |
 | `-d, --directory DIR` | Output directory for the file (used with `-o`) |
 | `-n, --name TOKEN` | Add name token to output filename |
 | `-m, --markdown` | Output in Markdown format instead of JSON |
+| `--debug` | Save raw JSearch API responses to `jsearch-debug-YYYYMMDD-HHMMSS.json` |
 
 ### Examples
 

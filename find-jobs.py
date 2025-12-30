@@ -1,7 +1,8 @@
 import argparse
+import json
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from google import genai
@@ -40,31 +41,52 @@ def load_resume_text(resume_path: str | Path) -> str:
         return ""
 
 
-def build_date_posted_value(days_ago: int | str | None) -> str:
-    try:
-        days = int(days_ago) if days_ago is not None else 0
-    except (TypeError, ValueError):
-        days = 0
-
-    if days <= 0:
+def build_date_posted_value(days_ago: int) -> str:
+    """Map days_ago to valid JSearch date_posted values: today, 3days, week, month.
+    
+    Returns a value broad enough to cover the requested range (we filter locally after).
+    """
+    if days_ago <= 0:
         return "today"
-    if days == 1:
-        return "1day"
-    return f"{days}days"
+    if days_ago <= 3:
+        return "3days"
+    if days_ago <= 7:
+        return "week"
+    return "month"
 
 
-def get_bulk_jobs(config: dict, rapidapi_key: str) -> list:
+def filter_jobs_by_date(jobs: list, days_ago: int) -> list:
+    """Filter jobs to only those posted within the last `days_ago` days."""
+    if days_ago < 0:
+        return jobs
+    
+    # Calculate cutoff timestamp (start of day, days_ago days back)
+    now = datetime.now()
+    cutoff = datetime(now.year, now.month, now.day) - timedelta(days=days_ago)
+    cutoff_ts = cutoff.timestamp()
+    
+    filtered = []
+    for job in jobs:
+        posted_ts = job.get("job_posted_at_timestamp")
+        if posted_ts and posted_ts >= cutoff_ts:
+            filtered.append(job)
+    return filtered
+
+
+def get_bulk_jobs(config: dict, rapidapi_key: str, *, debug: bool = False) -> list:
     """Fetches ~100-200 fresh remote systems jobs based on config queries."""
     print("Fetching jobs from JSearch...", file=sys.stderr)
     url = "https://jsearch.p.rapidapi.com/search"
 
     queries = config.get("queries") or []
-    date_posted = build_date_posted_value(config.get("date_posted_days_ago", 0))
+    days_ago = int(config.get("date_posted_days_ago", 0))
+    date_posted = build_date_posted_value(days_ago)
     remote_only = bool(config.get("remote_jobs_only", True))
 
     all_jobs = []
+    debug_responses = []
 
-    for q in queries:
+    for i, q in enumerate(queries):
         querystring = {
             "query": q,
             "page": "1",
@@ -83,14 +105,34 @@ def get_bulk_jobs(config: dict, rapidapi_key: str) -> list:
                 params=querystring,
             )
 
-            data = response.json().get("data", [])
+            response_json = response.json()
+            if debug:
+                debug_responses.append({
+                    "query": q,
+                    "querystring": querystring,
+                    "response": response_json,
+                })
+
+            data = response_json.get("data", [])
             all_jobs.extend(data)
             print(f"  Got {len(data)} jobs for '{q}'", file=sys.stderr)
             time.sleep(1)  # Rate limit safety
         except Exception as e:  # noqa: BLE001
             print(f"  Error fetching {q}: {e}", file=sys.stderr)
 
-    return all_jobs
+    # Save debug output if enabled
+    if debug and debug_responses:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        debug_file = Path(f"jsearch-debug-{timestamp}.json")
+        debug_file.write_text(json.dumps(debug_responses, indent=2), encoding="utf-8")
+        print(f"  Debug: saved raw API responses to {debug_file}", file=sys.stderr)
+
+    # Filter locally to the exact day range requested
+    filtered_jobs = filter_jobs_by_date(all_jobs, days_ago)
+    if len(filtered_jobs) < len(all_jobs):
+        print(f"  Filtered to {len(filtered_jobs)} jobs within last {days_ago} days", file=sys.stderr)
+    
+    return filtered_jobs
 
 
 def analyze_jobs(
@@ -120,18 +162,37 @@ def analyze_jobs(
 
 {output_instruction}
 
-MY RESUME:
+=== MY RESUME (this is MY background - do NOT include this as a job match) ===
 {resume_block}
+=== END OF RESUME ===
 
-JOB LIST:
+=== JOB LISTINGS TO EVALUATE (only evaluate jobs from this section) ===
 {jobs_text}
+=== END OF JOB LISTINGS ===
+
+IMPORTANT: Only return matches from the JOB LISTINGS section above. 
+Do NOT include my own work experience from my resume as a job match.
 """.strip()
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt,
-    )
-    return response.text
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                if attempt < max_retries - 1:
+                    wait_time = 30 * (attempt + 1)  # 30s, 60s, 90s
+                    print(f"  Rate limited. Waiting {wait_time}s before retry...", file=sys.stderr)
+                    time.sleep(wait_time)
+                else:
+                    raise
+            else:
+                raise
+    return ""
 
 
 def main():
@@ -167,13 +228,18 @@ def main():
         "-f",
         "--from-days",
         type=int,
-        help="Override 'date_posted_days_ago' (0=today, 1=yesterday, etc.).",
+        help="Override 'date_posted_days_ago'. Any value supported (filtered locally).",
     )
     parser.add_argument(
         "-m",
         "--markdown",
         action="store_true",
         help="Output results in markdown format instead of JSON.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Save raw JSearch API responses to debug files.",
     )
     args = parser.parse_args()
 
@@ -209,7 +275,7 @@ def main():
     client = genai.Client(api_key=google_api_key)
 
     print("Starting downloading jobs", file=sys.stderr)
-    jobs = get_bulk_jobs(config, rapidapi_key)
+    jobs = get_bulk_jobs(config, rapidapi_key, debug=args.debug)
     print(f"{len(jobs)} jobs found.", file=sys.stderr)
     if jobs:
         analysis = analyze_jobs(jobs, client, config, resume_text, markdown=args.markdown)
