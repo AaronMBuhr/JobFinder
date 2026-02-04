@@ -1,5 +1,8 @@
 requests
 google-genai
+anthropic
+openai
 PyYAML
 python-docx
+python-dotenv
 

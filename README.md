@@ -45,6 +45,9 @@ date_posted_days_ago: 3
 # Limit to remote jobs only
 remote_jobs_only: true
 
+# How many JSearch pages to fetch per query (default 10, more pages = more listings)
+jsearch_pages_per_query: 5
+
 # Path to your resume (.txt, .md, or .docx)
 # Use forward slashes or escape backslashes on Windows
 resume_file: "resume.docx"
@@ -82,6 +85,7 @@ prompt: |
 |-------|---------|-------------|
 | `date_posted_days_ago` | `0` | How far back to search |
 | `remote_jobs_only` | `true` | Filter to remote positions |
+| `jsearch_pages_per_query` | `10` | Number of JSearch pages to pull for each query (more pages ≈ more results). |
 
 ## Usage
 

@@ -1,5 +1,40 @@
 rapidapi_key: "YOUR_RAPIDAPI_KEY"
-google_api_key: "YOUR_GOOGLE_API_KEY"
+# Environment variable name to use for RapidAPI key (overrides rapidapi_key if set)
+rapidapi_key_env_var: "RAPIDAPI_KEY"
+
+# =============================================================================
+# LLM PROVIDER CONFIGURATION
+# =============================================================================
+# Choose which LLM to use: "gemini", "claude", or "chatgpt"
+llm_provider: "gemini"
+
+# Provider-specific configurations
+# Each provider has its own section with all required settings
+llm_providers:
+  gemini:
+    # API key can be provided directly or via environment variable
+    api_key: "YOUR_GOOGLE_API_KEY"
+    # Environment variable name to use for API key (overrides api_key if set)
+    api_key_env_var: "GOOGLE_API_KEY"
+    model: "gemini-2.0-flash"
+  
+  claude:
+    # API key can be provided directly or via environment variable
+    api_key: "YOUR_ANTHROPIC_API_KEY"
+    # Environment variable name to use for API key (overrides api_key if set)
+    api_key_env_var: "ANTHROPIC_API_KEY"
+    model: "claude-sonnet-4-20250514"
+    # Claude-specific: maximum tokens for response (default: 16384)
+    max_tokens: 16384
+  
+  chatgpt:
+    # API key can be provided directly or via environment variable
+    api_key: "YOUR_OPENAI_API_KEY"
+    # Environment variable name to use for API key (overrides api_key if set)
+    api_key_env_var: "OPENAI_API_KEY"
+    model: "gpt-4o-mini"
+    # ChatGPT-specific: maximum tokens for response (default: 16384)
+    max_tokens: 16384
 
 # Broad search terms to pull a large set of remote jobs; the LLM will filter.
 # REQUIRED: provide at least one query.
@@ -15,16 +50,56 @@ date_posted_days_ago: 3
 # Limit to remote jobs only.
 remote_jobs_only: true
 
+# How many JSearch pages to pull per query (more pages ≈ more listings)
+jsearch_pages_per_query: 10
+
+# =============================================================================
+# EXCLUSION FILTERS (apply even if technologies are on your resume)
+# =============================================================================
+# Use these to filter out jobs you DON'T want, even if you have the skills.
+# These are enforced both locally (pre-filter) and in the LLM prompt.
+
+# Technologies to AVOID - jobs requiring these will be excluded
+# Example: You know React but want backend-only roles
+exclude_technologies:
+  # - React
+  # - TypeScript
+  # - Angular
+  # - Vue
+
+# Role types to AVOID - matched against job titles (case-insensitive)
+# Example: You want pure backend, not full-stack
+exclude_role_types:
+  # - Full-Stack
+  # - Full Stack
+  # - Frontend
+  # - Front-End
+
+# Keywords in job descriptions that should trigger exclusion
+exclude_keywords:
+  # - "React-first"
+  # - "frontend-focused"
+
 # Path to your resume/CV. Supports .txt, .md, or .docx.
 # If omitted, you must supply --resume at runtime.
 # Use forward slashes or escape backslashes in Windows paths.
 resume_file: "resume.docx"
 
-# REQUIRED: Prompt instructions sent to Gemini before appending your resume + job list.
-# Use {job_count} as a placeholder for the number of jobs.
+# REQUIRED: Prompt instructions sent to the LLM before appending your resume + job list.
+# Available placeholders:
+#   {job_count} - number of jobs being evaluated
+#   {exclusion_rules} - auto-generated from exclude_* lists above
 prompt: |
   I am a Senior Software Engineer.
   Attached is my Resume and a list of {job_count} recent job postings.
+
+  ==========================================================
+  EXCLUSION RULES - CHECK THESE FIRST
+  ==========================================================
+  
+  {exclusion_rules}
+  
+  ==========================================================
 
   TASK:
   Identify the jobs that match my profile with a score of 90/100 or higher.
@@ -32,8 +107,7 @@ prompt: |
   STRICT FILTERING CRITERIA:
   1. MUST involve Python, Go, or systems programming.
   2. MUST be backend, infrastructure, or platform engineering.
-  3. REJECT all Frontend, React, or Web Design roles.
-  4. REJECT all staffing agencies.
+  3. REJECT all staffing agencies.
 
   Return the results in descending order by score.
 
@@ -58,3 +132,7 @@ prompt: |
   each position should have the company name dash position name as the title, then
   beneath that header it would have the remaining information, and then a margin or gap
   before the next position.
+
+  In your response, include only the selected output information either as markdown or json,
+  as specified below.
+

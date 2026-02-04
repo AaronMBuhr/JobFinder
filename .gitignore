@@ -18,9 +18,13 @@ env/
 # Output files
 find-jobs-*.json
 find-jobs-*.md
+jsearch-debug-*.*
 
 # Config with secrets - use find-jobs.yaml.example as template
 find-jobs.yaml
+
+# Local batch/shell scripts
+run-find-jobs.bat
 
 # Resume files (keep private)
 *.docx
