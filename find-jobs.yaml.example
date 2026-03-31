@@ -36,12 +36,29 @@ llm_providers:
     # ChatGPT-specific: maximum tokens for response (default: 16384)
     max_tokens: 16384
 
-# Broad search terms to pull a large set of remote jobs; the LLM will filter.
+# =============================================================================
+# SEARCH QUERIES
+# =============================================================================
+# Search terms to pull job listings from JSearch. The LLM scores and filters
+# results, so queries should be broad enough to capture relevant postings but
+# specific enough to avoid flooding with irrelevant noise.
+#
+# Tips for effective queries:
+#   - Use specific role titles: "Backend Engineer", "Software Engineer",
+#     "Data Platform Engineer", "DevOps Engineer"
+#   - Avoid ambiguous titles like "Systems Engineer" (means IT infrastructure
+#     in defense/enterprise but low-level software in other contexts)
+#   - Pair role titles with key technologies or architectural terms
+#   - Add "Remote" to target remote positions
+#
+# Advanced: JSearch supports Boolean-style queries. You can combine terms:
+#   - '("Software Engineer" OR "Backend Engineer") AND "Python" AND "distributed systems"'
+#   - '("Data Engineer" OR "Platform Engineer") AND ("Spark" OR "Kafka")'
+#
 # REQUIRED: provide at least one query.
 queries:
   - "Senior Software Engineer Remote"
-  - "Backend Developer Remote"
-  - "Systems Engineer Remote"
+  - "Senior Backend Engineer Remote"
 
 # Number of days back from today to include (any value, filtered locally).
 # 0 = today only, 7 = last week, 14 = last two weeks, etc.
@@ -50,8 +67,62 @@ date_posted_days_ago: 3
 # Limit to remote jobs only.
 remote_jobs_only: true
 
-# How many JSearch pages to pull per query (more pages ≈ more listings)
+# How many JSearch pages to pull per query (more pages = more listings but
+# higher API usage). Each page returns ~10 jobs.
 jsearch_pages_per_query: 10
+
+# =============================================================================
+# AGGREGATOR / REPOST SITE BLOCKING
+# =============================================================================
+# Known job aggregator sites that scrape real job postings from legitimate
+# companies and repost them under their own name to farm resumes.
+# Signs of aggregators:
+#   - They post jobs "at Netflix" or "at MongoDB" but the employer is their name
+#   - They tag US jobs as "Remote in Indonesia" or "Remote in Spain" to bait clicks
+#   - Apply links go through their portal, not the real company's ATS
+#
+# Jobs from these companies are automatically removed before LLM analysis.
+# Case-insensitive substring match against employer_name.
+blocked_companies:
+  # - Flexionis
+  # - Taskium
+  # - Jobgether
+  # - Lensa
+  # - Braintrust
+  # - Turing
+
+# Domains in apply links that indicate aggregator/repost sites.
+# If a job's apply link contains any of these domains, it is removed.
+blocked_link_domains:
+  # - flexionis.wuaze.com
+  # - taskium.co
+  # - jobgether.com
+  # - lensa.com
+
+# =============================================================================
+# LOCATION / COUNTRY FILTERING
+# =============================================================================
+# Only include jobs from these countries (case-insensitive).
+# Leave empty or comment out to accept jobs from all countries.
+# Uses the country field from JSearch API (e.g., "US", "GB", "CA", "DE", "AU").
+# Jobs with no country data are kept (benefit of the doubt).
+target_countries:
+  # - US
+
+# =============================================================================
+# STAFFING AGENCY FILTERING
+# =============================================================================
+# When enabled, filters out postings from staffing/recruiting agencies.
+# Auto-detects common patterns like "on behalf of our client", "W2/C2C",
+# "contract-to-hire", etc.
+filter_staffing_agencies: false
+
+# Specific company names to treat as staffing agencies (in addition to
+# the auto-detection heuristics above).
+staffing_agency_names:
+  # - Dice
+  # - PDSSOFT
+  # - Tricon Solutions
 
 # =============================================================================
 # EXCLUSION FILTERS (apply even if technologies are on your resume)
@@ -59,39 +130,56 @@ jsearch_pages_per_query: 10
 # Use these to filter out jobs you DON'T want, even if you have the skills.
 # These are enforced both locally (pre-filter) and in the LLM prompt.
 
-# Technologies to AVOID - jobs requiring these will be excluded
-# Example: You know React but want backend-only roles
+# Technologies to AVOID - jobs requiring these will be excluded.
+# Example: You know React but want backend-only roles.
+# Matched against job TITLE (case-insensitive).
 exclude_technologies:
   # - React
   # - TypeScript
   # - Angular
   # - Vue
 
-# Role types to AVOID - matched against job titles (case-insensitive)
-# Example: You want pure backend, not full-stack
+# Role types to AVOID - matched against job titles (case-insensitive).
+# Example: You want pure backend, not full-stack.
 exclude_role_types:
   # - Full-Stack
   # - Full Stack
   # - Frontend
   # - Front-End
 
-# Keywords in job descriptions that should trigger exclusion
+# Keywords in job descriptions that should trigger exclusion.
+# Case-insensitive substring match against the full description.
+# Use this for domain-specific terms you want to avoid.
 exclude_keywords:
-  # - "React-first"
-  # - "frontend-focused"
+  # - "security clearance"
+  # - "polygraph"
+  # - "orbital mechanics"
+  # - "embedded systems"
 
+# =============================================================================
+# RESUME
+# =============================================================================
 # Path to your resume/CV. Supports .txt, .md, or .docx.
 # If omitted, you must supply --resume at runtime.
 # Use forward slashes or escape backslashes in Windows paths.
 resume_file: "resume.docx"
 
-# REQUIRED: Prompt instructions sent to the LLM before appending your resume + job list.
+# =============================================================================
+# LLM PROMPT
+# =============================================================================
+# The prompt sent to the LLM along with job listings and your resume.
+# Customize this to describe YOUR background and what YOU are looking for.
+#
 # Available placeholders:
-#   {job_count} - number of jobs being evaluated
-#   {exclusion_rules} - auto-generated from exclude_* lists above
+#   {job_count}       - number of jobs being evaluated
+#   {exclusion_rules} - auto-generated from all filter settings above
+#
+# NOTE: Scoring calibration, aggregator detection, and output format
+# instructions are added automatically by the app. You do NOT need to
+# include those here. Focus on describing your profile and matching criteria.
 prompt: |
-  I am a Senior Software Engineer.
-  Attached is my Resume and a list of {job_count} recent job postings.
+  I am looking for a new role.
+  Attached is my resume and a list of {job_count} recent job postings.
 
   ==========================================================
   EXCLUSION RULES - CHECK THESE FIRST
@@ -102,37 +190,17 @@ prompt: |
   ==========================================================
 
   TASK:
-  Identify the jobs that match my profile with a score of 90/100 or higher.
+  Identify the jobs that match my profile with a score of 85/100 or higher.
 
-  STRICT FILTERING CRITERIA:
-  1. MUST involve Python, Go, or systems programming.
-  2. MUST be backend, infrastructure, or platform engineering.
-  3. REJECT all staffing agencies.
+  MATCHING CRITERIA:
+  - Match my technical skills and experience level to the job requirements
+  - Prioritize roles where my background is a strong domain fit
+  - Consider both technical skills AND domain/industry alignment
+  - Higher scores for roles that closely align with my career trajectory
+
+  STRICT REJECTION CRITERIA:
+  - Jobs requiring domain expertise clearly absent from my resume
+  - Jobs that match on surface-level keywords but are in a different domain context
+  - Roles significantly above or below my experience level
 
   Return the results in descending order by score.
-
-  If JSON output is selected below, return a JSON array where each object has:
-    - "position": Position Name
-    - "company": Company Name
-    - "score": Match Score (integer)
-    - "reason": Why it fits
-    - "short_description": A summary of the position information provided in the listing
-    - "link": Application URL
-
-  If markdown output is selected below, explicitly specify the following information
-  for each position:
-    * Position Name
-    * Company
-    * Match Score
-    * Why it fits
-    * Short Description (a summary of the position information provided in the position listing)
-    * Link
-
-  If markdown output is selected below, then group the results by position. The markdown for
-  each position should have the company name dash position name as the title, then
-  beneath that header it would have the remaining information, and then a margin or gap
-  before the next position.
-
-  In your response, include only the selected output information either as markdown or json,
-  as specified below.
-

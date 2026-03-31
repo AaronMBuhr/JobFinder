@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import requests
@@ -355,6 +357,307 @@ def load_resume_text(resume_path: str | Path) -> str:
         return ""
 
 
+# =============================================================================
+# Resume Caching and Compression
+# =============================================================================
+
+RESUME_CACHE_FILE = Path("resume.cached")
+
+RESUME_COMPRESSION_PROMPT = """You are a resume compressor for job-matching.
+
+INPUT: A resume in plain text or Markdown.
+OUTPUT: A compact plain-text "LLM Matching Payload" suitable to compare against job descriptions.
+
+Hard constraints:
+- Output must be <= 2400 characters.
+- Output must be plain text only (no code fences).
+- Do NOT invent skills, tools, or experience not explicitly present in the resume.
+- Preserve important duty wording and all technologies mentioned in duties.
+
+What to KEEP (in this exact structure):
+
+NAME | Location
+Headline: <short role label>
+
+Skills: <single line, comma-separated; include languages, cloud, infra, databases, core backend keywords found in resume>
+
+Experience
+<Most recent company> — <title> (<dates>, <location/remote>)
+• <3–6 duty bullets: copy or lightly compress the resume's real duties; MUST retain architecture/scale/reliability details and tech stack>
+
+<Second most recent company> — <title> (<dates>, <location/remote>)
+• <3–5 duty bullets: same rules>
+
+Continue through last minimum 10 years of jobs 
+
+Earlier roles (high level)
+• <Company> — <Title>: <ONE sentence duty/impact summary copied/condensed from resume>
+• <Company> — <Title>: <ONE sentence duty/impact summary copied/condensed from resume>
+
+Education: <one line, degree + school>
+
+What to REMOVE:
+- phone, email, LinkedIn, GitHub URLs
+- long summaries, soft-skill fluff, repeated headings
+- projects unless they contain unique technologies not shown elsewhere
+- any duty bullets that are purely generic (e.g., "collaborated with team") unless they include unique tech or measurable impact
+
+Normalization rules:
+- Collapse whitespace; keep the bullet marker "•"
+- Prefer concrete duties that indicate fit: backend services, infra, reliability, distributed systems, data pipelines, CI/CD, production ops
+
+Now produce the compact payload from the resume below:
+
+"""
+
+RESUME_VERIFICATION_PROMPT = """You are a resume verification assistant.
+
+Your task is to verify that a condensed resume accurately represents the original full resume.
+
+IMPORTANT RULES:
+- The condensed version should capture all key skills, technologies, job titles, companies, and dates.
+- It should NOT invent or add anything not in the original.
+- It should NOT omit critical technical skills, job roles, or significant achievements.
+- Minor wording differences are acceptable if the meaning is preserved.
+- The condensed version must be <= 2400 characters.
+
+Below is the ORIGINAL FULL RESUME:
+---
+{full_resume}
+---
+
+Below is the CONDENSED VERSION:
+---
+{condensed_resume}
+---
+
+If the condensed version is an accurate representation of the original:
+- Reply with EXACTLY: ACCURATE
+
+If the condensed version has issues (missing critical info, invented content, or significant misrepresentation):
+- Reply with: NEEDS_CORRECTION
+- Then provide a corrected condensed version on the next line (plain text, no code fences, <= 2400 chars)
+
+Your response:
+"""
+
+
+def compute_resume_checksum(resume_text: str) -> str:
+    """Compute SHA256 checksum of the resume text.
+    
+    Args:
+        resume_text: The full resume text content.
+        
+    Returns:
+        Hex string of the SHA256 hash.
+    """
+    return hashlib.sha256(resume_text.encode("utf-8")).hexdigest()
+
+
+def load_resume_cache(cache_path: Path = RESUME_CACHE_FILE) -> dict | None:
+    """Load the cached compressed resume if it exists.
+    
+    Args:
+        cache_path: Path to the cache file.
+        
+    Returns:
+        Dict with 'checksum', 'payload', 'timestamp' or None if not found.
+    """
+    if not cache_path.exists():
+        return None
+    
+    try:
+        cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
+        # Validate required fields
+        if all(k in cache_data for k in ("checksum", "payload", "timestamp")):
+            return cache_data
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  Warning: Could not read resume cache: {e}", file=sys.stderr)
+    
+    return None
+
+
+def save_resume_cache(
+    checksum: str, 
+    payload: str, 
+    cache_path: Path = RESUME_CACHE_FILE
+) -> None:
+    """Save the compressed resume to cache.
+    
+    Args:
+        checksum: SHA256 checksum of the original resume.
+        payload: The compressed resume text.
+        cache_path: Path to the cache file.
+    """
+    cache_data = {
+        "checksum": checksum,
+        "payload": payload,
+        "timestamp": datetime.now().isoformat(),
+    }
+    cache_path.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
+    print(f"  Resume cache saved to {cache_path}", file=sys.stderr)
+
+
+def compress_resume(resume_text: str, provider: "LLMProvider") -> str:
+    """Compress the resume using the LLM for job-matching.
+    
+    This is a two-stage process:
+    1. Initial compression to create a condensed version
+    2. Verification that the condensed version accurately represents the original
+    
+    Args:
+        resume_text: The full resume text.
+        provider: The LLM provider to use.
+        
+    Returns:
+        Compressed resume payload (<= 2400 chars).
+    """
+    print(f"  Stage 1: Compressing resume using {provider.name} ({provider.model})...", file=sys.stderr)
+    
+    prompt = RESUME_COMPRESSION_PROMPT + resume_text
+    compressed = provider.generate(prompt)
+    
+    # Strip any code fences the LLM might have added
+    compressed = _strip_code_fences(compressed)
+    
+    # Warn if over limit
+    if len(compressed) > 2400:
+        print(f"  Warning: Initial compressed resume is {len(compressed)} chars (target: 2400)", file=sys.stderr)
+    else:
+        print(f"  Initial compressed resume: {len(compressed)} chars", file=sys.stderr)
+    
+    # Stage 2: Verify the compressed resume
+    compressed = verify_compressed_resume(resume_text, compressed, provider)
+    
+    return compressed
+
+
+def _strip_code_fences(text: str) -> str:
+    """Strip code fences from LLM output."""
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        if "```" in text:
+            text = text.rsplit("```", 1)[0]
+        text = text.strip()
+    return text
+
+
+def verify_compressed_resume(
+    full_resume: str, 
+    compressed_resume: str, 
+    provider: "LLMProvider"
+) -> str:
+    """Verify and potentially correct the compressed resume.
+    
+    Stage 2 of the compression process: asks the LLM to verify that the 
+    condensed version accurately represents the original full resume.
+    
+    Args:
+        full_resume: The original full resume text.
+        compressed_resume: The initially compressed resume.
+        provider: The LLM provider to use.
+        
+    Returns:
+        The verified (or corrected) compressed resume.
+    """
+    print(f"  Stage 2: Verifying compressed resume accuracy...", file=sys.stderr)
+    
+    prompt = RESUME_VERIFICATION_PROMPT.format(
+        full_resume=full_resume,
+        condensed_resume=compressed_resume
+    )
+    
+    response = provider.generate(prompt)
+    response = response.strip()
+    
+    # Check if the response indicates accuracy
+    if response.upper().startswith("ACCURATE"):
+        print(f"  Verification: Condensed resume is accurate", file=sys.stderr)
+        return compressed_resume
+    
+    # The LLM indicated corrections are needed
+    if response.upper().startswith("NEEDS_CORRECTION"):
+        print(f"  Verification: Corrections needed, applying...", file=sys.stderr)
+        
+        # Extract the corrected version (everything after "NEEDS_CORRECTION" line)
+        lines = response.split("\n", 1)
+        if len(lines) > 1:
+            corrected = lines[1].strip()
+            corrected = _strip_code_fences(corrected)
+            
+            if len(corrected) > 2400:
+                print(f"  Warning: Corrected resume is {len(corrected)} chars (target: 2400)", file=sys.stderr)
+            else:
+                print(f"  Corrected compressed resume: {len(corrected)} chars", file=sys.stderr)
+            
+            return corrected
+        else:
+            print(f"  Warning: LLM indicated corrections needed but provided none, using original", file=sys.stderr)
+            return compressed_resume
+    
+    # Unexpected response format - log and return original
+    print(f"  Warning: Unexpected verification response format, using original compressed version", file=sys.stderr)
+    print(f"  Response preview: {response[:200]}...", file=sys.stderr)
+    return compressed_resume
+
+
+def get_resume_for_matching(
+    resume_path: str | Path, 
+    provider: "LLMProvider",
+    *,
+    force_refresh: bool = False,
+) -> tuple[str, str]:
+    """Get the compressed resume for job matching, using cache if valid.
+    
+    This function:
+    1. Loads the full resume text
+    2. Computes its checksum
+    3. Checks if a valid cache exists (matching checksum)
+    4. If cache valid, returns cached payload
+    5. If cache invalid/missing, compresses via LLM and caches result
+    
+    Args:
+        resume_path: Path to the resume file.
+        provider: LLM provider for compression.
+        force_refresh: If True, bypass cache and recompress.
+        
+    Returns:
+        Tuple of (compressed_resume, full_resume_text).
+        The compressed resume is used for job matching,
+        the full text is available if needed.
+    """
+    # Load full resume
+    full_resume = load_resume_text(resume_path)
+    if not full_resume:
+        return "", ""
+    
+    # Compute checksum
+    checksum = compute_resume_checksum(full_resume)
+    print(f"Resume checksum: {checksum[:16]}...", file=sys.stderr)
+    
+    # Check cache
+    if not force_refresh:
+        cache = load_resume_cache()
+        if cache and cache.get("checksum") == checksum:
+            print(f"  Using cached compressed resume (from {cache.get('timestamp', 'unknown')})", file=sys.stderr)
+            return cache["payload"], full_resume
+        elif cache:
+            print("  Resume changed - recompressing...", file=sys.stderr)
+        else:
+            print("  No cached resume found - compressing...", file=sys.stderr)
+    else:
+        print("  Force refresh requested - recompressing...", file=sys.stderr)
+    
+    # Compress and cache
+    compressed = compress_resume(full_resume, provider)
+    save_resume_cache(checksum, compressed)
+    
+    return compressed, full_resume
+
+
 def build_date_posted_value(days_ago: int) -> str:
     """Map days_ago to valid JSearch date_posted values: today, 3days, week, month.
     
@@ -443,6 +746,156 @@ def filter_jobs_by_exclusions(jobs: list, config: dict) -> list:
     return filtered
 
 
+def filter_blocked_companies(jobs: list, config: dict) -> list:
+    """Filter out jobs posted by known aggregator/repost sites.
+    
+    Aggregator sites scrape legitimate job postings from real companies
+    and repost them under their own name to collect applicant data.
+    Common offenders include Flexionis, Taskium, Jobgether, Lensa, etc.
+    """
+    blocked = [c.lower().strip() for c in (config.get("blocked_companies") or [])]
+    if not blocked:
+        return jobs
+    
+    filtered = []
+    blocked_count = 0
+    for job in jobs:
+        employer = (job.get("employer_name") or "").lower().strip()
+        if any(b in employer for b in blocked):
+            blocked_count += 1
+            continue
+        filtered.append(job)
+    
+    if blocked_count:
+        print(f"  Filtered {blocked_count} jobs from blocked companies (aggregators)", file=sys.stderr)
+    return filtered
+
+
+def filter_by_country(jobs: list, config: dict) -> list:
+    """Filter jobs to only include those in configured target countries.
+    
+    If target_countries is not set or empty, all jobs pass through.
+    Jobs with no country data are kept (benefit of the doubt).
+    """
+    target_countries = [c.lower().strip() for c in (config.get("target_countries") or [])]
+    if not target_countries:
+        return jobs
+    
+    filtered = []
+    excluded_count = 0
+    for job in jobs:
+        country = (job.get("job_country") or "").lower().strip()
+        if not country or country in target_countries:
+            filtered.append(job)
+        else:
+            excluded_count += 1
+    
+    if excluded_count:
+        countries_str = ", ".join(c.upper() for c in target_countries)
+        print(f"  Filtered {excluded_count} jobs outside target countries ({countries_str})", file=sys.stderr)
+    return filtered
+
+
+def filter_blocked_link_domains(jobs: list, config: dict) -> list:
+    """Filter out jobs whose apply links point to known aggregator domains."""
+    blocked_domains = [d.lower().strip() for d in (config.get("blocked_link_domains") or [])]
+    if not blocked_domains:
+        return jobs
+    
+    filtered = []
+    blocked_count = 0
+    for job in jobs:
+        link = (job.get("job_apply_link") or "").lower()
+        is_blocked = False
+        if link:
+            try:
+                domain = urlparse(link).netloc
+                is_blocked = any(bd in domain for bd in blocked_domains)
+            except Exception:
+                pass
+        
+        if is_blocked:
+            blocked_count += 1
+        else:
+            filtered.append(job)
+    
+    if blocked_count:
+        print(f"  Filtered {blocked_count} jobs with blocked link domains", file=sys.stderr)
+    return filtered
+
+
+def filter_staffing_agencies(jobs: list, config: dict) -> list:
+    """Filter out jobs from staffing/recruiting agencies.
+    
+    Uses two methods:
+    1. Explicit list of agency names from config (staffing_agency_names)
+    2. Heuristic detection based on description patterns
+    """
+    if not config.get("filter_staffing_agencies", False):
+        return jobs
+    
+    agency_names = [n.lower().strip() for n in (config.get("staffing_agency_names") or [])]
+    
+    agency_description_patterns = [
+        "on behalf of our client",
+        "our client is seeking",
+        "our client is looking",
+        "w2/c2c",
+        "w2 or c2c",
+        "c2c/w2",
+        "corp-to-corp",
+        "corp to corp",
+        "contract to hire",
+        "contract-to-hire",
+        "staffing agency",
+        "recruiting agency",
+        "talent acquisition firm",
+    ]
+    
+    filtered = []
+    excluded_count = 0
+    
+    for job in jobs:
+        employer = (job.get("employer_name") or "").lower().strip()
+        description = (job.get("job_description") or "").lower()
+        
+        if any(name in employer for name in agency_names):
+            excluded_count += 1
+            continue
+        
+        if any(pattern in description for pattern in agency_description_patterns):
+            excluded_count += 1
+            continue
+        
+        filtered.append(job)
+    
+    if excluded_count:
+        print(f"  Filtered {excluded_count} jobs from staffing agencies", file=sys.stderr)
+    return filtered
+
+
+def deduplicate_jobs(jobs: list) -> list:
+    """Remove duplicate job listings based on job_id.
+    
+    When running multiple search queries, the same job can appear in
+    results from different queries. This keeps only the first occurrence.
+    """
+    seen_ids: set[str] = set()
+    unique = []
+    for job in jobs:
+        job_id = job.get("job_id")
+        if job_id and job_id in seen_ids:
+            continue
+        if job_id:
+            seen_ids.add(job_id)
+        unique.append(job)
+    
+    dedup_count = len(jobs) - len(unique)
+    if dedup_count:
+        print(f"  Removed {dedup_count} duplicate job listings", file=sys.stderr)
+    return unique
+
+
 def get_bulk_jobs(config: dict, rapidapi_key: str, *, debug: bool = False) -> list:
     """Fetches remote job listings for each configured query."""
     print("Fetching jobs from JSearch...", file=sys.stderr)
@@ -513,9 +966,44 @@ def build_exclusion_rules(config: dict) -> str:
     """Build dynamic exclusion rules section from config lists.
     
     Generates clear, explicit instructions for the LLM based on user-configured
-    exclusion lists. These rules apply regardless of what's on the resume.
+    exclusion lists. These are defense-in-depth: most are also enforced as
+    pre-filters, but the LLM should catch anything that slips through.
     """
     rules = []
+    
+    # Blocked companies (aggregators/repost sites)
+    blocked_companies = config.get("blocked_companies") or []
+    if blocked_companies:
+        company_list = ", ".join(blocked_companies)
+        rules.append(f"""BLOCKED COMPANIES (known aggregator/repost sites — REJECT immediately):
+  {company_list}
+  
+  These are resume-farming sites that scrape real job postings and repost them.
+  If the employer name matches any of these, EXCLUDE the job.
+  Also EXCLUDE any job where the employer appears to be a generic aggregator but
+  the description clearly describes a role at a different well-known company
+  (e.g., employer is "Flexionis" but description says "at Netflix").""")
+    
+    # Target countries
+    target_countries = config.get("target_countries") or []
+    if target_countries:
+        country_list = ", ".join(target_countries)
+        rules.append(f"""TARGET COUNTRIES (reject jobs outside these):
+  {country_list}
+  
+  Only include jobs located in or remote-eligible for these countries.
+  If a job is tagged with a country NOT in this list, EXCLUDE it.""")
+    
+    # Staffing agencies
+    if config.get("filter_staffing_agencies", False):
+        agency_names = config.get("staffing_agency_names") or []
+        agency_str = ", ".join(agency_names) if agency_names else "(auto-detected)"
+        rules.append(f"""STAFFING AGENCIES (reject unless role details are exceptionally clear):
+  Known agencies: {agency_str}
+  
+  Reject postings from staffing firms, recruiting agencies, or talent marketplaces.
+  Indicators: "on behalf of our client", "W2/C2C", "contract-to-hire", vague role
+  descriptions with no named end client.""")
     
     # Excluded technologies
     exclude_techs = config.get("exclude_technologies") or []
@@ -555,32 +1043,166 @@ def build_exclusion_rules(config: dict) -> str:
     return "\n\n".join(rules)
 
 
+def build_scoring_guidance() -> str:
+    """Build scoring calibration instructions for the LLM.
+    
+    These are generic quality-check instructions that apply regardless of the
+    user's specific profile. They address common failure modes in job-matching:
+    surface-level keyword matching, aggregator reposts, and domain mismatches.
+    """
+    return """
+============================================================
+SCORING CALIBRATION — READ BEFORE SCORING ANY JOB
+============================================================
+
+Your scoring must go BEYOND surface-level keyword overlap. Apply these checks:
+
+1. AGGREGATOR / REPOST DETECTION:
+   If the employer name looks like a generic staffing or aggregator company but the
+   job description clearly describes a role at a DIFFERENT well-known company,
+   this is a scraped repost. REJECT it (score 0). Signs of reposts:
+   - Employer name doesn't match the company described in the body
+   - Apply link domain doesn't match the employer
+   - Description says "About [Famous Company]" but employer is something else
+
+2. DOMAIN EXPERTISE FIT (most important calibration):
+   Do NOT give high scores based on programming language overlap alone.
+   The DOMAIN and CONTEXT of the work must match the candidate's background.
+   Examples of BAD matches despite keyword overlap:
+   - "Python" in QA automation ≠ "Python" in backend architecture
+   - "C++" in embedded/RTOS ≠ "C++" in distributed systems
+   - "Systems Engineer" in aerospace/defense ≠ "Systems Engineer" in software
+   - "Data Engineer" doing ETL scripts ≠ "Data Platform Engineer" building infra
+   Ask: "Would this candidate's actual work history prepare them for THIS role's
+   day-to-day responsibilities?" If not, score LOW.
+
+3. UNREALISTIC REQUIREMENTS CHECK:
+   If a job requires specific domain expertise, certifications, or clearances that
+   are NOT evident in the candidate's resume, score it LOW regardless of tool overlap.
+   Examples: security clearance, specific industry certifications, niche domain
+   knowledge (aerospace, biotech, quant finance) that doesn't appear in the resume.
+
+4. SENIORITY ALIGNMENT:
+   A Staff/Principal role should not score high for a mid-level candidate, and vice
+   versa. Check years-of-experience requirements against the resume timeline.
+
+5. SCORE MEANING:
+   95-100: Near-perfect fit — skills, domain, seniority, and tech stack all align
+   90-94:  Strong fit — most requirements match with minor gaps
+   85-89:  Good fit — solid overlap but some requirements are a stretch
+   Below 85: Do not include in results
+"""
+
+
+def extract_whitelisted_job_fields(job: dict) -> dict:
+    """Extract only the whitelisted fields from a job for LLM analysis.
+    
+    This reduces the amount of data sent to the LLM, lowering costs while
+    preserving the information needed for job matching and quality checks.
+    """
+    highlights = job.get("job_highlights") or {}
+    
+    return {
+        "job_id": job.get("job_id"),
+        "job_title": job.get("job_title"),
+        "employer_name": job.get("employer_name"),
+        "job_publisher": job.get("job_publisher"),
+        "job_employment_type": job.get("job_employment_type"),
+        "job_apply_link": job.get("job_apply_link"),
+        "apply_options": job.get("apply_options"),
+        "job_description": job.get("job_description"),
+        "job_is_remote": job.get("job_is_remote"),
+        "qualifications": highlights.get("Qualifications"),
+        "responsibilities": highlights.get("Responsibilities"),
+    }
+
+
 def build_prompt(jobs: list, config: dict, resume_text: str, *, markdown: bool = False) -> str:
-    """Build the analysis prompt for LLM providers."""
+    """Build the analysis prompt for LLM providers.
+    
+    Assembles the complete prompt from:
+    1. User's custom prompt (from YAML) with exclusion rules injected
+    2. Scoring calibration guidance (generic, code-generated)
+    3. Output format instructions
+    4. Job listings (whitelisted fields only)
+    5. Resume text
+    """
+    # Extract whitelisted fields for each job
     jobs_text = ""
-    for i, job in enumerate(jobs):
-        jobs_text += f"\n--- JOB ID {i} ---\n"
-        jobs_text += f"Title: {job.get('job_title')}\n"
-        jobs_text += f"Link: {job.get('job_apply_link')}\n"
-        jobs_text += f"Description: {job.get('job_description')}\n"
+    for job in jobs:
+        whitelisted = extract_whitelisted_job_fields(job)
+        jobs_text += f"\n--- JOB: {whitelisted.get('job_id')} ---\n"
+        jobs_text += f"Job ID: {whitelisted.get('job_id')}\n"
+        jobs_text += f"Title: {whitelisted.get('job_title')}\n"
+        jobs_text += f"Employer: {whitelisted.get('employer_name')}\n"
+        if whitelisted.get('job_publisher'):
+            jobs_text += f"Publisher: {whitelisted.get('job_publisher')}\n"
+        jobs_text += f"Employment Type: {whitelisted.get('job_employment_type')}\n"
+        jobs_text += f"Application URL: {whitelisted.get('job_apply_link') or ''}\n"
+        jobs_text += f"Apply Options: {json.dumps(whitelisted.get('apply_options') or [])}\n"
+        jobs_text += f"Remote: {whitelisted.get('job_is_remote')}\n"
+        if whitelisted.get('qualifications'):
+            jobs_text += f"Qualifications: {whitelisted.get('qualifications')}\n"
+        if whitelisted.get('responsibilities'):
+            jobs_text += f"Responsibilities: {whitelisted.get('responsibilities')}\n"
+        jobs_text += f"Description: {whitelisted.get('job_description')}\n"
 
     # Build dynamic exclusion rules from config
     exclusion_rules = build_exclusion_rules(config)
     
-    base_prompt = (config.get("prompt") or "").replace("{job_count}", str(len(jobs))).replace("{exclusion_rules}", exclusion_rules)
+    base_prompt = (
+        (config.get("prompt") or "")
+        .replace("{job_count}", str(len(jobs)))
+        .replace("{exclusion_rules}", exclusion_rules)
+    )
 
     resume_block = resume_text if resume_text else "[No resume text provided]"
 
-    if markdown:
-        output_instruction = "Return the results in markdown format."
-    else:
-        output_instruction = "Return the results in json format."
+    scoring_guidance = build_scoring_guidance()
 
-    # Double the prompt for increased accuracy (sends instructions twice)
+    output_instruction = """
+============================================================
+IMPORTANT: OUTPUT FORMAT OVERRIDE
+============================================================
+
+Return ONLY a JSON array containing the job_id, score, reason, job_apply_link, and apply_options for each matching job.
+DO NOT include any other job details in your response.
+
+Format your response as a JSON array like this:
+[
+  {
+    "job_id": "abc123==",
+    "score": 95,
+    "reason": "Brief reason",
+    "job_apply_link": "https://example.com/apply/abc123",
+    "apply_options": [{"publisher": "LinkedIn", "apply_link": "https://..."}]
+  },
+  {
+    "job_id": "xyz789==",
+    "score": 92,
+    "reason": "Brief reason",
+    "job_apply_link": "https://example.com/apply/xyz789",
+    "apply_options": []
+  }
+]
+
+Each object must have exactly these fields:
+- "job_id": The exact job_id string from the job listing (preserve the == suffix if present)
+- "score": Integer match score (85-100)
+- "reason": Brief 1-2 sentence explanation of why this job matches
+- "job_apply_link": Copy exactly from the matching job listing (string or null)
+- "apply_options": Copy exactly from the matching job listing (array; include all options, use [] if none)
+
+Return ONLY this JSON array - no markdown, no additional text, no other job details.
+"""
+
+    # Double the user's prompt for increased accuracy (sends instructions twice)
     doubled_prompt = f"{base_prompt}\n\n{base_prompt}"
 
     prompt = f"""
 {doubled_prompt}
+
+{scoring_guidance}
 
 {output_instruction}
 
@@ -592,17 +1214,19 @@ def build_prompt(jobs: list, config: dict, resume_text: str, *, markdown: bool =
 {resume_block}
 === END OF RESUME ===
 
-CRITICAL VALIDATION:
-- Every result MUST have a valid HTTPS application URL
-- If a "job" has no link or says "based on my work experience", EXCLUDE IT
-- Only return actual job postings from external companies
+CRITICAL REMINDER:
+- Return ONLY a JSON array with job_id, score, reason, job_apply_link, and apply_options for each matching job
+- Use the EXACT job_id from the listings (including any == suffix)
+- Copy job_apply_link and apply_options exactly from each matching listing
+- Do not include any other fields or formatting
+- Apply the SCORING CALIBRATION rules above — reject surface-level keyword matches
 """.strip()
 
     return prompt
 
 
 def analyze_jobs(
-    jobs: list, provider: LLMProvider, config: dict, resume_text: str, *, markdown: bool = False
+    jobs: list, provider: LLMProvider, config: dict, resume_text: str, *, markdown: bool = False, debug: bool = False
 ) -> str:
     """Sends all jobs to the configured LLM for analysis.
     
@@ -612,14 +1236,213 @@ def analyze_jobs(
         config: Application configuration dict.
         resume_text: The user's resume text.
         markdown: Whether to return markdown (True) or JSON (False).
+        debug: Whether to save the LLM query to a debug file.
         
     Returns:
-        The LLM's analysis response.
+        The LLM's analysis response (JSON array of job_id, score, reason, job_apply_link, apply_options).
     """
     print(f"Sending {len(jobs)} jobs to {provider.name} ({provider.model})", file=sys.stderr)
     
     prompt = build_prompt(jobs, config, resume_text, markdown=markdown)
+    
+    # Debug: save the LLM query to a file for review
+    if debug:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        debug_filename = f"llmquery-debug-{timestamp}.json"
+        debug_data = {
+            "timestamp": timestamp,
+            "provider": provider.name,
+            "model": provider.model,
+            "job_count": len(jobs),
+            "prompt_length_chars": len(prompt),
+            "prompt": prompt,
+        }
+        Path(debug_filename).write_text(json.dumps(debug_data, indent=2), encoding="utf-8")
+        print(f"  Debug: saved LLM query to {debug_filename}", file=sys.stderr)
+        
+        # TEMPORARY: Hard break to review query before sending to LLM
+        input("Press Enter to continue and send query to LLM (or Ctrl+C to abort)...")
+    
     return provider.generate(prompt)
+
+
+def parse_llm_job_scores(llm_response: str) -> list[dict]:
+    """Parse the LLM response to extract matched job entries.
+    
+    Args:
+        llm_response: Raw LLM response text containing JSON array.
+        
+    Returns:
+        List of dicts with job_id, score, reason, and optional link/apply options.
+    """
+    text = llm_response.strip()
+    
+    # Strip markdown code fences if present
+    if text.startswith('```'):
+        first_newline = text.find('\n')
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        if '```' in text:
+            text = text.rsplit('```', 1)[0]
+        text = text.strip()
+    
+    # Try to find and extract JSON array
+    if not text.startswith('['):
+        start = text.find('[')
+        end = text.rfind(']')
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
+    
+    try:
+        results = json.loads(text)
+        if isinstance(results, list):
+            return results
+    except json.JSONDecodeError:
+        pass
+    
+    return []
+
+
+def merge_scores_with_jobs(
+    llm_results: list[dict], 
+    jobs: list[dict], 
+    *, 
+    markdown: bool = False
+) -> str:
+    """Merge LLM scoring results back with full job data.
+    
+    Takes LLM match entries and combines them with
+    the full job data to produce the final output.
+    
+    Args:
+        llm_results: List of dicts with job_id, score, reason, and optional apply metadata from LLM.
+        jobs: Full list of job dictionaries from JSearch.
+        markdown: Whether to output markdown (True) or JSON (False).
+        
+    Returns:
+        Complete analysis output with full job details and scores.
+    """
+    # Build lookup dict for jobs by job_id
+    jobs_by_id = {job.get("job_id"): job for job in jobs if job.get("job_id")}
+    
+    # Build output by matching LLM results to full job data
+    matched_jobs = []
+    
+    for result in llm_results:
+        job_id = result.get("job_id")
+        score = result.get("score")
+        reason = result.get("reason", "")
+        
+        if not job_id or score is None:
+            continue
+        
+        full_job = jobs_by_id.get(job_id)
+        if not full_job:
+            print(f"  Warning: job_id '{job_id}' from LLM not found in job list", file=sys.stderr)
+            continue
+        
+        # Build the complete job record with score
+        matched_job = {
+            "position": full_job.get("job_title"),
+            "company": full_job.get("employer_name"),
+            "score": score,
+            "reason": reason,
+            "requirements": _extract_requirements(full_job),
+            "short_description": _build_short_description(full_job),
+            "link": result.get("job_apply_link", full_job.get("job_apply_link")),
+            "job_apply_link": result.get("job_apply_link", full_job.get("job_apply_link")),
+            "apply_options": result.get("apply_options"),
+            # Include additional useful fields
+            "job_id": job_id,
+            "employment_type": full_job.get("job_employment_type"),
+            "is_remote": full_job.get("job_is_remote"),
+            "location": full_job.get("job_location"),
+            "city": full_job.get("job_city"),
+            "state": full_job.get("job_state"),
+            "country": full_job.get("job_country"),
+        }
+        if not isinstance(matched_job.get("apply_options"), list):
+            matched_job["apply_options"] = full_job.get("apply_options") or []
+        matched_jobs.append(matched_job)
+    
+    # Sort by score descending
+    matched_jobs.sort(key=lambda x: x.get("score", 0), reverse=True)
+    
+    if markdown:
+        return _format_jobs_as_markdown(matched_jobs)
+    else:
+        return json.dumps(matched_jobs, indent=2)
+
+
+def _extract_requirements(job: dict) -> list[str]:
+    """Extract key requirements from job highlights."""
+    highlights = job.get("job_highlights") or {}
+    qualifications = highlights.get("Qualifications") or []
+    
+    # Return first few qualifications as requirements
+    if isinstance(qualifications, list):
+        return qualifications[:5]  # Limit to first 5
+    return []
+
+
+def _build_short_description(job: dict) -> str:
+    """Build a short description from job data."""
+    description = job.get("job_description") or ""
+    
+    # Take first ~500 chars as summary
+    if len(description) > 500:
+        # Try to cut at a sentence boundary
+        cut_point = description[:500].rfind('. ')
+        if cut_point > 200:
+            return description[:cut_point + 1]
+        return description[:500] + "..."
+    
+    return description
+
+
+def _format_jobs_as_markdown(jobs: list[dict]) -> str:
+    """Format matched jobs as markdown output."""
+    lines = []
+    
+    for job in jobs:
+        company = job.get("company", "Unknown Company")
+        position = job.get("position", "Unknown Position")
+        score = job.get("score", 0)
+        reason = job.get("reason", "")
+        link = job.get("link", "")
+        requirements = job.get("requirements", [])
+        short_desc = job.get("short_description", "")
+        is_remote = job.get("is_remote", False)
+        location = job.get("location") or ""
+        
+        lines.append(f"## {company} - {position}")
+        lines.append("")
+        lines.append(f"**Match Score:** {score}/100")
+        lines.append("")
+        lines.append(f"**Why it fits:** {reason}")
+        lines.append("")
+        
+        if requirements:
+            lines.append("**Requirements:**")
+            for req in requirements:
+                lines.append(f"- {req}")
+            lines.append("")
+        
+        lines.append(f"**Remote:** {'Yes' if is_remote else 'No'}")
+        if location:
+            lines.append(f"**Location:** {location}")
+        lines.append("")
+        
+        if short_desc:
+            lines.append(f"**Description:** {short_desc}")
+            lines.append("")
+        
+        lines.append(f"**[Apply Here]({link})**")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    
+    return "\n".join(lines)
 
 
 def clean_duplicate_output(analysis: str, *, markdown: bool = False) -> str:
@@ -858,6 +1681,11 @@ def main():
         action="store_true",
         help="Save raw JSearch API responses to debug files.",
     )
+    parser.add_argument(
+        "--refresh-resume",
+        action="store_true",
+        help="Force recompression of resume even if cached version exists.",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -909,42 +1737,49 @@ def main():
             raise ValueError("--from-days must be >= 0")
         config["date_posted_days_ago"] = args.from_days
 
-    resume_text = load_resume_text(resume_path)
-
-    print("Starting downloading jobs", file=sys.stderr)
-    jobs = get_bulk_jobs(config, rapidapi_key, debug=args.debug)
-    print(f"{len(jobs)} jobs found.", file=sys.stderr)
+    # Load and compress resume (uses cache if valid)
+    print("Loading resume...", file=sys.stderr)
+    compressed_resume, full_resume = get_resume_for_matching(
+        resume_path, 
+        llm_provider,
+        force_refresh=args.refresh_resume,
+    )
     
-    # Apply local exclusion filters before sending to LLM
+    if not compressed_resume:
+        print("Warning: No resume available for matching.", file=sys.stderr)
+
+    print("Fetching job listings...", file=sys.stderr)
+    jobs = get_bulk_jobs(config, rapidapi_key, debug=args.debug)
+    print(f"{len(jobs)} raw jobs fetched.", file=sys.stderr)
+    
+    # Pre-LLM filtering pipeline (cheapest/most aggressive filters first)
+    jobs = deduplicate_jobs(jobs)
+    jobs = filter_blocked_companies(jobs, config)
+    jobs = filter_by_country(jobs, config)
+    jobs = filter_blocked_link_domains(jobs, config)
+    jobs = filter_staffing_agencies(jobs, config)
     jobs = filter_jobs_by_exclusions(jobs, config)
-    print(f"{len(jobs)} jobs remaining after exclusion filters.", file=sys.stderr)
+    print(f"{len(jobs)} jobs remaining after all pre-filters.", file=sys.stderr)
     
     if jobs:
-        analysis = analyze_jobs(jobs, llm_provider, config, resume_text, markdown=args.markdown)
+        # Step 1: Send whitelisted job data to LLM, get back job_id + score pairs
+        # Use compressed resume for efficient matching
+        llm_response = analyze_jobs(jobs, llm_provider, config, compressed_resume, markdown=args.markdown, debug=args.debug)
         
         # Debug: show raw response from LLM
-        print(f"DEBUG: Raw {llm_provider.name} response length: {len(analysis)} chars", file=sys.stderr)
-        print(f"DEBUG: Raw {llm_provider.name} response preview (first 500 chars): {analysis[:500]}", file=sys.stderr)
+        print(f"DEBUG: Raw {llm_provider.name} response length: {len(llm_response)} chars", file=sys.stderr)
+        print(f"DEBUG: Raw {llm_provider.name} response preview (first 500 chars): {llm_response[:500]}", file=sys.stderr)
         
-        # Post-process: clean up mixed format output, then validate entries
-        analysis_before_clean = analysis
-        analysis = clean_duplicate_output(analysis, markdown=args.markdown)
-        print(f"DEBUG: After clean_duplicate_output length: {len(analysis)} chars", file=sys.stderr)
+        # Step 2: Parse LLM response to extract job_id and score pairs
+        llm_results = parse_llm_job_scores(llm_response)
+        print(f"DEBUG: Parsed {len(llm_results)} job scores from LLM response", file=sys.stderr)
         
-        analysis_before_validate = analysis
-        analysis = validate_results(analysis, markdown=args.markdown)
-        print(f"DEBUG: After validate_results length: {len(analysis)} chars", file=sys.stderr)
+        # Step 3: Merge LLM scores with full job data to produce final output
+        analysis = merge_scores_with_jobs(llm_results, jobs, markdown=args.markdown)
+        print(f"DEBUG: Final analysis length: {len(analysis)} chars", file=sys.stderr)
 
-        # Count actual results returned by Gemini
-        selected_count = 0
-        if not args.markdown:
-            try:
-                selected_count = len(json.loads(analysis))
-            except (json.JSONDecodeError, TypeError):
-                selected_count = 0  # Can't parse, unknown count
-        else:
-            # For markdown, count section headers as a rough estimate
-            selected_count = analysis.count('\n## ') + analysis.count('\n### ')
+        # Count actual results
+        selected_count = len(llm_results)
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         ext = ".md" if args.markdown else ".json"

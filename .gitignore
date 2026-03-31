@@ -19,6 +19,7 @@ env/
 find-jobs-*.json
 find-jobs-*.md
 jsearch-debug-*.*
+llmquery-debug-*.*
 
 # Config with secrets - use find-jobs.yaml.example as template
 find-jobs.yaml
@@ -28,6 +29,5 @@ run-find-jobs.bat
 
 # Resume files (keep private)
 *.docx
-resume*.txt
-resume*.md
+resume*.*
 
